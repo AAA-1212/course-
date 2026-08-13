@@ -77,7 +77,7 @@ try {
   }
   console.log('   OK read marker=', data.__connectionProbe)
 
-  console.log('4) Write shared/history + shared/access smoke...')
+  console.log('4) Write shared/history + shared/access + shared/draft smoke...')
   await setDoc(
     doc(db, 'shared', 'history'),
     {
@@ -99,6 +99,20 @@ try {
     },
     { merge: true },
   )
+  await setDoc(
+    doc(db, 'shared', 'draft'),
+    {
+      __connectionProbe: marker,
+      coursePlan: [],
+      updatedAt: serverTimestamp(),
+      savedAt: new Date().toISOString(),
+    },
+    { merge: true },
+  )
+  const draftSnap = await getDoc(doc(db, 'shared', 'draft'))
+  if (!draftSnap.exists() || draftSnap.data().__connectionProbe !== marker) {
+    throw new Error('Draft write/read failed')
+  }
   console.log('   OK')
 
   console.log('\nFIREBASE_OK')

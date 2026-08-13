@@ -11,6 +11,7 @@ export const CLOUD_PATHS = {
   library: ['shared', 'library'],
   history: ['shared', 'history'],
   access: ['shared', 'access'],
+  draft: ['shared', 'draft'],
 }
 
 const toMillis = (value) => {
@@ -152,6 +153,22 @@ export const writeAccessCloud = async (config) => {
     {
       enabled: Boolean(config?.enabled && config?.pinHash),
       pinHash: typeof config?.pinHash === 'string' ? config.pinHash : '',
+      updatedAt: serverTimestamp(),
+      savedAt: new Date().toISOString(),
+    },
+    { merge: true },
+  )
+}
+
+export const writeDraftCloud = async (draft) => {
+  const db = getFirebaseDb()
+  if (!db) {
+    return
+  }
+  await setDoc(
+    doc(db, ...CLOUD_PATHS.draft),
+    {
+      ...draft,
       updatedAt: serverTimestamp(),
       savedAt: new Date().toISOString(),
     },
