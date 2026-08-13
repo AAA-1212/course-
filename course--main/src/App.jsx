@@ -1,6 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toPng } from 'html-to-image'
 import { jsPDF } from 'jspdf'
+import {
+  CLOUD_PATHS,
+  connectCloudSync,
+  readSharedDoc,
+  subscribeSharedDoc,
+  writeAccessCloud,
+  writeHistoryCloud,
+  writeLibraryCloud,
+} from './cloudSync'
+import { isFirebaseConfigured } from './firebase'
 import './App.css'
 
 const CENTER_NAME = 'مركز القمة كلاسك'
@@ -12,8 +22,67 @@ const DRAFT_STORAGE_KEY = 'coach-course-draft-v3'
 const HISTORY_STORAGE_KEY = 'coach-course-history-v1'
 // مفاتيح ثابتة — لا تغيّرها حتى تبقى بيانات الجهاز بعد تحديث GitHub/Netlify
 const LIBRARY_STORAGE_KEY = 'coach-exercise-library-v1'
+const ACCESS_LOCK_STORAGE_KEY = 'coach-access-lock-v1'
+const ACCESS_SESSION_KEY = 'coach-access-unlocked-v1'
 const LEGACY_DRAFT_KEYS = ['coach-course-draft-v2', 'coach-course-draft-v1']
 const CATALOG_VERSION = 3
+const ACCESS_PIN_MIN_LENGTH = 4
+const ACCESS_PIN_MAX_LENGTH = 8
+
+const loadAccessLockConfig = () => {
+  try {
+    const raw = localStorage.getItem(ACCESS_LOCK_STORAGE_KEY)
+    if (!raw) {
+      return { enabled: false, pinHash: '' }
+    }
+    const parsed = JSON.parse(raw)
+    const pinHash = typeof parsed?.pinHash === 'string' ? parsed.pinHash : ''
+    return {
+      enabled: Boolean(parsed?.enabled && pinHash),
+      pinHash,
+    }
+  } catch {
+    return { enabled: false, pinHash: '' }
+  }
+}
+
+const persistAccessLockConfig = (config) => {
+  localStorage.setItem(ACCESS_LOCK_STORAGE_KEY, JSON.stringify(config))
+}
+
+const readAccessSessionUnlocked = () => {
+  try {
+    return sessionStorage.getItem(ACCESS_SESSION_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+const writeAccessSessionUnlocked = (unlocked) => {
+  try {
+    if (unlocked) {
+      sessionStorage.setItem(ACCESS_SESSION_KEY, '1')
+    } else {
+      sessionStorage.removeItem(ACCESS_SESSION_KEY)
+    }
+  } catch {
+    // تجاهل فشل sessionStorage
+  }
+}
+
+const hashAccessPin = async (pin) => {
+  const payload = new TextEncoder().encode(`top-classic-access:${pin}`)
+  const digest = await crypto.subtle.digest('SHA-256', payload)
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+const isValidAccessPin = (pin) =>
+  typeof pin === 'string' &&
+  /^\d+$/.test(pin) &&
+  pin.length >= ACCESS_PIN_MIN_LENGTH &&
+  pin.length <= ACCESS_PIN_MAX_LENGTH
 // مقاس A4 للتصميم والتصدير
 const A4_WIDTH_PX = 2480
 const A4_HEIGHT_PX = 3508
@@ -524,7 +593,29 @@ function App() {
   const [hasHydrated, setHasHydrated] = useState(false)
   const [coursePickMode, setCoursePickMode] = useState('normal') // normal | superset-2 | superset-3 | superset-4
   const [pendingSupersetIds, setPendingSupersetIds] = useState([])
+  const [accessLock, setAccessLock] = useState(() => loadAccessLockConfig())
+  const [isAccessUnlocked, setIsAccessUnlocked] = useState(() => {
+    const config = loadAccessLockConfig()
+    return !config.enabled || readAccessSessionUnlocked()
+  })
+  const [unlockPinInput, setUnlockPinInput] = useState('')
+  const [unlockError, setUnlockError] = useState('')
+  const [isUnlocking, setIsUnlocking] = useState(false)
+  const [securityWantCode, setSecurityWantCode] = useState(
+    () => loadAccessLockConfig().enabled,
+  )
+  const [securityPin, setSecurityPin] = useState('')
+  const [securityPinConfirm, setSecurityPinConfirm] = useState('')
+  const [securityCurrentPin, setSecurityCurrentPin] = useState('')
+  const [securityBusy, setSecurityBusy] = useState(false)
+  const [cloudStatus, setCloudStatus] = useState(
+    isFirebaseConfigured() ? 'connecting' : 'offline-local',
+  )
   const exportSheetRef = useRef(null)
+  const skipCloudWriteRef = useRef(false)
+  const cloudReadyRef = useRef(false)
+  const libraryCloudTimerRef = useRef(null)
+  const historyCloudTimerRef = useRef(null)
 
   const muscleSections = useMemo(
     () => mergeCustomSections(customSections),
@@ -771,6 +862,205 @@ function App() {
     courseHistory,
   ])
 
+  // مزامنة سحابية مشتركة بين كل الأجهزة على نفس رابط Firebase
+  useEffect(() => {
+    if (!hasHydrated || !isFirebaseConfigured()) {
+      if (!isFirebaseConfigured()) {
+        setCloudStatus('offline-local')
+      }
+      return undefined
+    }
+
+    let unsubLibrary = () => {}
+    let unsubHistory = () => {}
+    let unsubAccess = () => {}
+    let cancelled = false
+
+    const startCloud = async () => {
+      try {
+        setCloudStatus('connecting')
+        const connection = await connectCloudSync()
+        if (cancelled) {
+          return
+        }
+        if (!connection.ok) {
+          if (connection.reason === 'permission-denied') {
+            setCloudStatus('error')
+            setStatusMessage(
+              'Firebase متصل، لكن قواعد Firestore تمنع الحفظ. انشر قواعد firestore.rules من Console ثم أعد التحميل.',
+            )
+          } else if (connection.reason === 'auth-failed') {
+            setCloudStatus('error')
+            setStatusMessage(
+              'فشل Anonymous Auth — تأكد أنه مفعّل من Authentication في Firebase.',
+            )
+          } else {
+            setCloudStatus('offline-local')
+            setStatusMessage('المزامنة السحابية غير مفعّلة — البيانات محلية فقط')
+          }
+          return
+        }
+
+        const [remoteLibrary, remoteHistory, remoteAccess] = await Promise.all([
+          readSharedDoc(CLOUD_PATHS.library),
+          readSharedDoc(CLOUD_PATHS.history),
+          readSharedDoc(CLOUD_PATHS.access),
+        ])
+
+        if (cancelled) {
+          return
+        }
+
+        // أول تشغيل: ارفع بيانات الجهاز إلى السحابة إذا كانت فارغة
+        if (!remoteLibrary) {
+          const libraryPayload = {
+            exerciseLibrary: mergeWithCatalog(exerciseLibrary, muscleSections),
+            customSections,
+            catalogVersion: CATALOG_VERSION,
+          }
+          await writeLibraryCloud(libraryPayload)
+        }
+        if (!remoteHistory) {
+          await writeHistoryCloud(courseHistory)
+        }
+        if (!remoteAccess) {
+          await writeAccessCloud(accessLock)
+        }
+
+        cloudReadyRef.current = true
+        setCloudStatus('live')
+        setStatusMessage('المزامنة السحابية فعّالة — التغييرات تظهر على كل الأجهزة')
+
+        unsubLibrary = subscribeSharedDoc(
+          CLOUD_PATHS.library,
+          (data) => {
+            if (!data || !Array.isArray(data.exerciseLibrary)) {
+              return
+            }
+            skipCloudWriteRef.current = true
+            const sections = Array.isArray(data.customSections)
+              ? data.customSections
+              : []
+            setCustomSections(sections)
+            setExerciseLibrary(
+              mergeWithCatalog(
+                data.exerciseLibrary,
+                mergeCustomSections(sections),
+              ),
+            )
+            window.setTimeout(() => {
+              skipCloudWriteRef.current = false
+            }, 900)
+          },
+          () => setCloudStatus('error'),
+        )
+
+        unsubHistory = subscribeSharedDoc(
+          CLOUD_PATHS.history,
+          (data) => {
+            if (!data || !Array.isArray(data.items)) {
+              return
+            }
+            skipCloudWriteRef.current = true
+            setCourseHistory(data.items)
+            window.setTimeout(() => {
+              skipCloudWriteRef.current = false
+            }, 900)
+          },
+          () => setCloudStatus('error'),
+        )
+
+        unsubAccess = subscribeSharedDoc(
+          CLOUD_PATHS.access,
+          (data) => {
+            if (!data) {
+              return
+            }
+            const next = {
+              enabled: Boolean(data.enabled && data.pinHash),
+              pinHash: typeof data.pinHash === 'string' ? data.pinHash : '',
+            }
+            skipCloudWriteRef.current = true
+            setAccessLock(next)
+            persistAccessLockConfig(next)
+            setSecurityWantCode(next.enabled)
+            if (!next.enabled) {
+              setIsAccessUnlocked(true)
+            } else if (!readAccessSessionUnlocked()) {
+              setIsAccessUnlocked(false)
+            }
+            window.setTimeout(() => {
+              skipCloudWriteRef.current = false
+            }, 900)
+          },
+          () => setCloudStatus('error'),
+        )
+      } catch {
+        if (!cancelled) {
+          cloudReadyRef.current = false
+          setCloudStatus('error')
+          setStatusMessage(
+            'تعذر الاتصال بالسحابة — التطبيق يعمل محلياً حتى يتوفر الاتصال',
+          )
+        }
+      }
+    }
+
+    startCloud()
+
+    return () => {
+      cancelled = true
+      cloudReadyRef.current = false
+      unsubLibrary()
+      unsubHistory()
+      unsubAccess()
+    }
+    // نبدأ المزامنة مرة بعد التحميل الأولي فقط
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasHydrated])
+
+  useEffect(() => {
+    if (!hasHydrated || !cloudReadyRef.current || skipCloudWriteRef.current) {
+      return undefined
+    }
+    if (libraryCloudTimerRef.current) {
+      clearTimeout(libraryCloudTimerRef.current)
+    }
+    libraryCloudTimerRef.current = setTimeout(() => {
+      writeLibraryCloud({
+        exerciseLibrary: mergeWithCatalog(exerciseLibrary, muscleSections),
+        customSections,
+        catalogVersion: CATALOG_VERSION,
+      }).catch(() => {
+        setCloudStatus('error')
+      })
+    }, 700)
+    return () => {
+      if (libraryCloudTimerRef.current) {
+        clearTimeout(libraryCloudTimerRef.current)
+      }
+    }
+  }, [hasHydrated, exerciseLibrary, customSections, muscleSections])
+
+  useEffect(() => {
+    if (!hasHydrated || !cloudReadyRef.current || skipCloudWriteRef.current) {
+      return undefined
+    }
+    if (historyCloudTimerRef.current) {
+      clearTimeout(historyCloudTimerRef.current)
+    }
+    historyCloudTimerRef.current = setTimeout(() => {
+      writeHistoryCloud(courseHistory).catch(() => {
+        setCloudStatus('error')
+      })
+    }, 700)
+    return () => {
+      if (historyCloudTimerRef.current) {
+        clearTimeout(historyCloudTimerRef.current)
+      }
+    }
+  }, [hasHydrated, courseHistory])
+
   const filteredExercises = useMemo(() => {
     const query = normalizeText(exerciseSearch.trim())
     return exerciseLibrary
@@ -959,17 +1249,23 @@ function App() {
   }
 
   const toggleExerciseInDay = (exerciseId, dayIndex) => {
+    const dayExercises = coursePlan[dayIndex] ?? []
+    const alreadyIn = normalizeDayExercises(dayExercises).some((item) =>
+      daySlotIncludesExercise(item, exerciseId),
+    )
+    if (alreadyIn) {
+      setPendingSupersetIds([])
+    }
+
     setCoursePlan((previous) =>
-      previous.map((dayExercises, currentDayIndex) => {
+      previous.map((currentDayExercises, currentDayIndex) => {
         if (currentDayIndex !== dayIndex) {
-          return normalizeDayExercises(dayExercises)
+          return normalizeDayExercises(currentDayExercises)
         }
-        const normalized = normalizeDayExercises(dayExercises)
-        const alreadyIn = normalized.some((item) =>
-          daySlotIncludesExercise(item, exerciseId),
-        )
-        if (alreadyIn) {
-          setPendingSupersetId(null)
+        const normalized = normalizeDayExercises(currentDayExercises)
+        if (
+          normalized.some((item) => daySlotIncludesExercise(item, exerciseId))
+        ) {
           return normalized.filter(
             (item) => !daySlotIncludesExercise(item, exerciseId),
           )
@@ -1576,6 +1872,224 @@ function App() {
     }
   }
 
+  const clearSecurityPinFields = () => {
+    setSecurityPin('')
+    setSecurityPinConfirm('')
+    setSecurityCurrentPin('')
+  }
+
+  const handleUnlockSubmit = async (event) => {
+    event.preventDefault()
+    if (!isValidAccessPin(unlockPinInput)) {
+      setUnlockError(
+        `أدخل رمزاً من ${ACCESS_PIN_MIN_LENGTH} إلى ${ACCESS_PIN_MAX_LENGTH} أرقام`,
+      )
+      return
+    }
+    setIsUnlocking(true)
+    setUnlockError('')
+    try {
+      const hashed = await hashAccessPin(unlockPinInput)
+      if (hashed !== accessLock.pinHash) {
+        setUnlockError('الرمز غير صحيح')
+        setUnlockPinInput('')
+        return
+      }
+      writeAccessSessionUnlocked(true)
+      setIsAccessUnlocked(true)
+      setUnlockPinInput('')
+      setStatusMessage('تم فتح التطبيق بنجاح')
+    } catch {
+      setUnlockError('تعذر التحقق من الرمز، حاول مرة ثانية')
+    } finally {
+      setIsUnlocking(false)
+    }
+  }
+
+  const handleEnableAccessPin = async () => {
+    if (!isValidAccessPin(securityPin)) {
+      setStatusMessage(
+        `الرمز لازم يكون من ${ACCESS_PIN_MIN_LENGTH} إلى ${ACCESS_PIN_MAX_LENGTH} أرقام فقط`,
+      )
+      return
+    }
+    if (securityPin !== securityPinConfirm) {
+      setStatusMessage('الرمز وتأكيد الرمز غير متطابقين')
+      return
+    }
+    setSecurityBusy(true)
+    try {
+      const pinHash = await hashAccessPin(securityPin)
+      const next = { enabled: true, pinHash }
+      persistAccessLockConfig(next)
+      setAccessLock(next)
+      setSecurityWantCode(true)
+      writeAccessSessionUnlocked(true)
+      setIsAccessUnlocked(true)
+      clearSecurityPinFields()
+      if (cloudReadyRef.current) {
+        await writeAccessCloud(next)
+      }
+      setStatusMessage(
+        cloudReadyRef.current
+          ? 'تم تفعيل الرمز ومزامنته على كل الأجهزة'
+          : 'تم تفعيل رمز فتح الرابط',
+      )
+    } catch {
+      setStatusMessage('فشل حفظ الرمز، حاول مرة ثانية')
+    } finally {
+      setSecurityBusy(false)
+    }
+  }
+
+  const handleChangeAccessPin = async () => {
+    if (!isValidAccessPin(securityCurrentPin)) {
+      setStatusMessage('أدخل الرمز الحالي أولاً')
+      return
+    }
+    if (!isValidAccessPin(securityPin)) {
+      setStatusMessage(
+        `الرمز الجديد لازم يكون من ${ACCESS_PIN_MIN_LENGTH} إلى ${ACCESS_PIN_MAX_LENGTH} أرقام`,
+      )
+      return
+    }
+    if (securityPin !== securityPinConfirm) {
+      setStatusMessage('الرمز الجديد وتأكيده غير متطابقين')
+      return
+    }
+    setSecurityBusy(true)
+    try {
+      const currentHash = await hashAccessPin(securityCurrentPin)
+      if (currentHash !== accessLock.pinHash) {
+        setStatusMessage('الرمز الحالي غير صحيح')
+        return
+      }
+      const pinHash = await hashAccessPin(securityPin)
+      const next = { enabled: true, pinHash }
+      persistAccessLockConfig(next)
+      setAccessLock(next)
+      clearSecurityPinFields()
+      if (cloudReadyRef.current) {
+        await writeAccessCloud(next)
+      }
+      setStatusMessage(
+        cloudReadyRef.current
+          ? 'تم تغيير الرمز ومزامنته على كل الأجهزة'
+          : 'تم تغيير رمز الفتح',
+      )
+    } catch {
+      setStatusMessage('فشل تغيير الرمز، حاول مرة ثانية')
+    } finally {
+      setSecurityBusy(false)
+    }
+  }
+
+  const handleDisableAccessPin = async () => {
+    if (!isValidAccessPin(securityCurrentPin)) {
+      setStatusMessage('أدخل الرمز الحالي لإلغاء الحماية')
+      return
+    }
+    setSecurityBusy(true)
+    try {
+      const currentHash = await hashAccessPin(securityCurrentPin)
+      if (currentHash !== accessLock.pinHash) {
+        setStatusMessage('الرمز الحالي غير صحيح')
+        return
+      }
+      const next = { enabled: false, pinHash: '' }
+      persistAccessLockConfig(next)
+      setAccessLock(next)
+      setSecurityWantCode(false)
+      writeAccessSessionUnlocked(false)
+      clearSecurityPinFields()
+      if (cloudReadyRef.current) {
+        await writeAccessCloud(next)
+      }
+      setStatusMessage(
+        cloudReadyRef.current
+          ? 'تم إلغاء الرمز من كل الأجهزة'
+          : 'تم إلغاء رمز فتح الرابط',
+      )
+    } catch {
+      setStatusMessage('فشل إلغاء الرمز، حاول مرة ثانية')
+    } finally {
+      setSecurityBusy(false)
+    }
+  }
+
+  const handleLockNow = () => {
+    if (!accessLock.enabled) {
+      setStatusMessage('فعّل الرمز أولاً حتى تقدر تقفل التطبيق')
+      return
+    }
+    writeAccessSessionUnlocked(false)
+    setIsAccessUnlocked(false)
+    setUnlockPinInput('')
+    setUnlockError('')
+    setActiveTab('home')
+    setStatusMessage('تم قفل التطبيق')
+  }
+
+  const openSecurityTab = () => {
+    setSecurityWantCode(accessLock.enabled)
+    clearSecurityPinFields()
+    setActiveTab('security')
+  }
+
+  const cloudStatusLabel =
+    cloudStatus === 'live'
+      ? 'متصل بالسحابة'
+      : cloudStatus === 'connecting'
+        ? 'جاري الاتصال...'
+        : cloudStatus === 'error'
+          ? 'خطأ بالاتصال'
+          : 'محلي فقط'
+
+  if (accessLock.enabled && !isAccessUnlocked) {
+    return (
+      <main className="app access-lock-app" dir="rtl">
+        <section className="access-lock-screen">
+          <div className="access-lock-card">
+            <img
+              src="/logo-top-classic.png"
+              alt="Top Classic Gym"
+              className="access-lock-logo"
+            />
+            <p className="access-lock-eyebrow">{CENTER_NAME}</p>
+            <h1>رمز فتح الرابط</h1>
+            <p className="access-lock-hint">
+              التطبيق محمي برمز. أدخل الرمز للمتابعة على هذا الجهاز.
+            </p>
+            <form className="access-lock-form" onSubmit={handleUnlockSubmit}>
+              <label>
+                الرمز
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="current-password"
+                  maxLength={ACCESS_PIN_MAX_LENGTH}
+                  placeholder={`من ${ACCESS_PIN_MIN_LENGTH} إلى ${ACCESS_PIN_MAX_LENGTH} أرقام`}
+                  value={unlockPinInput}
+                  onChange={(event) => {
+                    const next = event.target.value.replace(/\D/g, '')
+                    setUnlockPinInput(next.slice(0, ACCESS_PIN_MAX_LENGTH))
+                    setUnlockError('')
+                  }}
+                />
+              </label>
+              {unlockError ? (
+                <p className="access-lock-error">{unlockError}</p>
+              ) : null}
+              <button type="submit" disabled={isUnlocking}>
+                {isUnlocking ? 'جاري التحقق...' : 'فتح التطبيق'}
+              </button>
+            </form>
+          </div>
+        </section>
+      </main>
+    )
+  }
+
   return (
     <main className="app" dir="rtl">
       <header className="hero">
@@ -1666,6 +2180,36 @@ function App() {
             </span>
             <span className="app-tab-label">السجل</span>
             <span className="app-tab-count">{courseHistory.length}</span>
+          </button>
+          <button
+            type="button"
+            className={activeTab === 'security' ? 'active' : ''}
+            onClick={openSecurityTab}
+          >
+            <span className="app-tab-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M7.5 10.2V8.4a4.5 4.5 0 0 1 9 0v1.8"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                />
+                <rect
+                  x="5.5"
+                  y="10.2"
+                  width="13"
+                  height="9.3"
+                  rx="2"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                />
+                <circle cx="12" cy="14.4" r="1.2" fill="currentColor" />
+              </svg>
+            </span>
+            <span className="app-tab-label">الحماية</span>
+            {accessLock.enabled ? (
+              <span className="app-tab-count">ON</span>
+            ) : null}
           </button>
           <button
             type="button"
@@ -2436,6 +2980,248 @@ function App() {
           </div>
         </div>
       </section>
+      )}
+
+      {activeTab === 'security' && (
+        <section className="security-page">
+          <div className="library-hero-bar">
+            <div>
+              <h2>الحماية والمزامنة</h2>
+              <p>
+                فعّل رمز فتح الرابط، والمزامنة السحابية تنقل المكتبة والسجل والرمز
+                بين حاسوبك وجوالك وأي جهاز يفتح نفس الرابط.
+              </p>
+            </div>
+            <div className="library-stat">
+              <strong>{accessLock.enabled ? 'مفعّل' : 'بدون رمز'}</strong>
+              <span>حالة الحماية</span>
+            </div>
+          </div>
+
+          <article className="panel security-panel">
+            <div className={`cloud-status-banner is-${cloudStatus}`}>
+              <strong>{cloudStatusLabel}</strong>
+              <span>
+                {cloudStatus === 'live'
+                  ? 'إضافة أو حذف تمرين يظهر مباشرة لبقية الأجهزة.'
+                  : cloudStatus === 'connecting'
+                    ? 'نحاول الاتصال بـ Google Firebase...'
+                    : cloudStatus === 'error'
+                      ? 'Anonymous Auth شغال غالباً، لكن انشر قواعد Firestore من Console (ملف firestore.rules) ثم أعد التحميل.'
+                      : 'ضع ملف .env بمفاتيح Firebase ثم أعد تشغيل المشروع.'}
+              </span>
+            </div>
+
+            <div className="panel-header">
+              <h2>إعداد الرمز</h2>
+              <p>
+                بعد تفعيل الرمز ومزامنة السحابة، أي جهاز يفتح الرابط يطلب الرمز قبل
+                الدخول.
+              </p>
+            </div>
+
+            <div className="security-mode-switch" role="group" aria-label="نوع الحماية">
+              <button
+                type="button"
+                className={!securityWantCode ? 'active' : ''}
+                onClick={() => {
+                  setSecurityWantCode(false)
+                  setSecurityPin('')
+                  setSecurityPinConfirm('')
+                }}
+              >
+                بدون رمز
+              </button>
+              <button
+                type="button"
+                className={securityWantCode ? 'active' : ''}
+                onClick={() => setSecurityWantCode(true)}
+              >
+                مع رمز
+              </button>
+            </div>
+
+            {!securityWantCode && (
+              <div className="security-block">
+                {accessLock.enabled ? (
+                  <>
+                    <p className="security-note">
+                      لإلغاء الحماية أدخل الرمز الحالي ثم أكّد الإلغاء.
+                    </p>
+                    <label>
+                      الرمز الحالي
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={ACCESS_PIN_MAX_LENGTH}
+                        value={securityCurrentPin}
+                        onChange={(event) =>
+                          setSecurityCurrentPin(
+                            event.target.value
+                              .replace(/\D/g, '')
+                              .slice(0, ACCESS_PIN_MAX_LENGTH),
+                          )
+                        }
+                        placeholder="أدخل الرمز الحالي"
+                      />
+                    </label>
+                    <div className="security-actions">
+                      <button
+                        type="button"
+                        className="security-danger-btn"
+                        disabled={securityBusy}
+                        onClick={handleDisableAccessPin}
+                      >
+                        تأكيد إلغاء الرمز
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="security-note success">
+                    التطبيق حالياً يفتح مباشرة بدون طلب رمز.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {securityWantCode && (
+              <div className="security-block">
+                {accessLock.enabled ? (
+                  <>
+                    <p className="security-note success">
+                      الرمز مفعّل. تقدر تغيّره أو تقفل التطبيق الآن من هذا الجهاز.
+                    </p>
+                    <label>
+                      الرمز الحالي
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={ACCESS_PIN_MAX_LENGTH}
+                        value={securityCurrentPin}
+                        onChange={(event) =>
+                          setSecurityCurrentPin(
+                            event.target.value
+                              .replace(/\D/g, '')
+                              .slice(0, ACCESS_PIN_MAX_LENGTH),
+                          )
+                        }
+                        placeholder="مطلوب لتغيير الرمز"
+                      />
+                    </label>
+                    <label>
+                      الرمز الجديد
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={ACCESS_PIN_MAX_LENGTH}
+                        value={securityPin}
+                        onChange={(event) =>
+                          setSecurityPin(
+                            event.target.value
+                              .replace(/\D/g, '')
+                              .slice(0, ACCESS_PIN_MAX_LENGTH),
+                          )
+                        }
+                        placeholder={`${ACCESS_PIN_MIN_LENGTH} إلى ${ACCESS_PIN_MAX_LENGTH} أرقام`}
+                      />
+                    </label>
+                    <label>
+                      تأكيد الرمز الجديد
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={ACCESS_PIN_MAX_LENGTH}
+                        value={securityPinConfirm}
+                        onChange={(event) =>
+                          setSecurityPinConfirm(
+                            event.target.value
+                              .replace(/\D/g, '')
+                              .slice(0, ACCESS_PIN_MAX_LENGTH),
+                          )
+                        }
+                        placeholder="أعد كتابة الرمز الجديد"
+                      />
+                    </label>
+                    <div className="security-actions">
+                      <button
+                        type="button"
+                        className="security-primary-btn"
+                        disabled={securityBusy}
+                        onClick={handleChangeAccessPin}
+                      >
+                        حفظ الرمز الجديد
+                      </button>
+                      <button
+                        type="button"
+                        className="security-secondary-btn"
+                        onClick={handleLockNow}
+                      >
+                        قفل التطبيق الآن
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <p className="security-note">
+                      فعّل الخانات التالية لتعيين رمز يُطلب عند فتح الرابط.
+                    </p>
+                    <label>
+                      الرمز
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={ACCESS_PIN_MAX_LENGTH}
+                        value={securityPin}
+                        onChange={(event) =>
+                          setSecurityPin(
+                            event.target.value
+                              .replace(/\D/g, '')
+                              .slice(0, ACCESS_PIN_MAX_LENGTH),
+                          )
+                        }
+                        placeholder={`${ACCESS_PIN_MIN_LENGTH} إلى ${ACCESS_PIN_MAX_LENGTH} أرقام`}
+                      />
+                    </label>
+                    <label>
+                      تأكيد الرمز
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={ACCESS_PIN_MAX_LENGTH}
+                        value={securityPinConfirm}
+                        onChange={(event) =>
+                          setSecurityPinConfirm(
+                            event.target.value
+                              .replace(/\D/g, '')
+                              .slice(0, ACCESS_PIN_MAX_LENGTH),
+                          )
+                        }
+                        placeholder="أعد كتابة نفس الرمز"
+                      />
+                    </label>
+                    <div className="security-actions">
+                      <button
+                        type="button"
+                        className="security-primary-btn"
+                        disabled={securityBusy}
+                        onClick={handleEnableAccessPin}
+                      >
+                        تفعيل الرمز
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            <ul className="security-tips">
+              <li>الرمز أرقام فقط، من 4 إلى 8 خانات.</li>
+              <li>بعد الفتح مرة، يبقى مفتوح لنفس تبويب المتصفح حتى تضغط «قفل الآن» أو تغلق التبويب.</li>
+              <li>مع Firebase: المكتبة والسجل والرمز مشتركة بين كل الأجهزة على نفس المشروع.</li>
+              <li>الرمز يُخزَّن مشفّراً (مو كنص ظاهر).</li>
+            </ul>
+          </article>
+        </section>
       )}
 
       {activeTab === 'about' && (

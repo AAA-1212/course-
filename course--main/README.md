@@ -1,16 +1,32 @@
-# React + Vite
+# مركز القمة كلاسك — منشئ كورسات التمرين
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+تطبيق ويب للمدرب لإعداد كورسات التمارين وتصديرها PDF/صورة، مع سوبر ست ومكتبة وتمارين وسجل.
 
-Currently, two official plugins are available:
+## التشغيل المحلي
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+npm install
+npm run dev
+```
 
-## React Compiler
+## المزامنة بين الأجهزة + الرفع على Google
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+البيانات المشتركة (المكتبة / السجل / رمز الحماية) تتم عبر **Firebase (Google)**.
 
-## Expanding the Oxlint configuration
+اتبع الدليل الكامل بالعربي:
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+- [DEPLOY-FIREBASE-AR.md](./DEPLOY-FIREBASE-AR.md)
+
+باختصار:
+
+1. أنشئ مشروع Firebase وفعّل Anonymous Auth + Firestore + Hosting
+2. انسخ المفاتيح إلى ملف `.env` من `.env.example`
+3. نفّذ:
+
+```bash
+firebase login
+firebase deploy --only firestore:rules
+npm run deploy
+```
+
+بعدها الرابط الرسمي يفتح من أي جهاز، والتعديلات تظهر للبقية مباشرة.

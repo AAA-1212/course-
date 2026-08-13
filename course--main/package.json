@@ -7,9 +7,13 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy:hosting": "npm run build && firebase deploy --only hosting",
+    "deploy:rules": "firebase deploy --only firestore:rules",
+    "deploy": "npm run build && firebase deploy --only hosting,firestore:rules"
   },
   "dependencies": {
+    "firebase": "^11.10.0",
     "html-to-image": "^1.11.13",
     "jspdf": "^4.2.1",
     "react": "^19.2.7",
