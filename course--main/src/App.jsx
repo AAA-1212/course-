@@ -4,6 +4,8 @@ import { jsPDF } from 'jspdf'
 import {
   CLOUD_PATHS,
   connectCloudSync,
+  normalizeDraftCloudData,
+  normalizeHistoryCloudData,
   readSharedDoc,
   subscribeSharedDoc,
   writeAccessCloud,
@@ -953,12 +955,8 @@ function App() {
     const latest = latestSharedRef.current
     const nextForm = overrides.formData || latest.formData || formData
     return {
-      formData: {
-        ...nextForm,
-        playerName: '',
-        weight: '',
-        height: '',
-      },
+      // كل بيانات الكورس تتشارك بين الأجهزة (بما فيها بيانات اللاعب)
+      formData: { ...nextForm },
       coursePlan: (overrides.coursePlan || latest.coursePlan || coursePlan).map(
         (day) => normalizeDayExercises(day ?? []),
       ),
@@ -978,6 +976,82 @@ function App() {
           ? overrides.activeHistoryId
           : latest.activeHistoryId ?? activeHistoryId,
       catalogVersion: CATALOG_VERSION,
+    }
+  }
+
+  const applyRemoteLibrary = (data) => {
+    if (!data || !Array.isArray(data.exerciseLibrary)) {
+      return
+    }
+    ignoreLibraryWriteRef.current = true
+    const sections = Array.isArray(data.customSections) ? data.customSections : []
+    setCustomSections(sections)
+    setExerciseLibrary(
+      mergeWithCatalog(data.exerciseLibrary, mergeCustomSections(sections)),
+    )
+  }
+
+  const applyRemoteHistory = (data) => {
+    const normalized = normalizeHistoryCloudData(data)
+    if (!normalized || !Array.isArray(normalized.items)) {
+      return
+    }
+    ignoreHistoryWriteRef.current = true
+    setCourseHistory(normalized.items)
+    persistHistoryToStorage(normalized.items)
+  }
+
+  const applyRemoteAccess = (data) => {
+    if (!data) {
+      return
+    }
+    const next = {
+      enabled: Boolean(data.enabled && data.pinHash),
+      pinHash: typeof data.pinHash === 'string' ? data.pinHash : '',
+    }
+    ignoreAccessWriteRef.current = true
+    setAccessLock(next)
+    persistAccessLockConfig(next)
+    setSecurityWantCode(next.enabled)
+    if (!next.enabled) {
+      setIsAccessUnlocked(true)
+    } else if (!readAccessSessionUnlocked()) {
+      setIsAccessUnlocked(false)
+    }
+  }
+
+  const applyRemoteDraft = (data) => {
+    const normalized = normalizeDraftCloudData(data)
+    if (!normalized || !Array.isArray(normalized.coursePlan)) {
+      return
+    }
+    ignoreDraftWriteRef.current = true
+    setCoursePlan(
+      normalized.coursePlan.map((day) => normalizeDayExercises(day ?? [])),
+    )
+    if (normalized.scheduleMode) {
+      setScheduleMode(normalized.scheduleMode)
+    }
+    if (normalized.workoutPatternId) {
+      setWorkoutPatternId(normalized.workoutPatternId)
+    }
+    if (Array.isArray(normalized.selectedWeekDayIds)) {
+      setSelectedWeekDayIds(normalized.selectedWeekDayIds)
+    }
+    if (Array.isArray(normalized.customDayLabels)) {
+      setCustomDayLabels(normalized.customDayLabels)
+    }
+    if (normalized.formData && typeof normalized.formData === 'object') {
+      setFormData((previous) => ({
+        ...previous,
+        ...normalized.formData,
+      }))
+    }
+    if (
+      typeof normalized.activeHistoryId === 'string' ||
+      normalized.activeHistoryId === null
+    ) {
+      setActiveHistoryId(normalized.activeHistoryId)
     }
   }
 
@@ -1046,120 +1120,63 @@ function App() {
           return
         }
 
-        // أول تشغيل: ارفع بيانات الجهاز إلى السحابة إذا كانت فارغة
-        if (!remoteLibrary) {
+        // Firebase هو المصدر الأساسي: نطبّق السحابة قبل تفعيل الكتابة
+        if (remoteLibrary) {
+          applyRemoteLibrary(remoteLibrary)
+        } else {
           await writeLibraryCloud({
             exerciseLibrary: mergeWithCatalog(exerciseLibrary, muscleSections),
             customSections,
             catalogVersion: CATALOG_VERSION,
           })
         }
-        if (!remoteHistory) {
+
+        if (remoteHistory) {
+          applyRemoteHistory(remoteHistory)
+        } else {
           await writeHistoryCloud(courseHistory)
         }
-        if (!remoteAccess) {
+
+        if (remoteAccess) {
+          applyRemoteAccess(remoteAccess)
+        } else {
           await writeAccessCloud(accessLock)
         }
-        if (!remoteDraft) {
+
+        if (remoteDraft) {
+          applyRemoteDraft(remoteDraft)
+        } else {
           await writeDraftCloud(buildDraftPayload())
         }
 
         cloudReadyRef.current = true
         setCloudReady(true)
         setCloudStatus('live')
-        setStatusMessage('المزامنة السحابية فعّالة — كل تعديل ينحفظ على Firebase')
+        setStatusMessage(
+          'كل بيانات الموقع مشتركة على Firebase وتتحدث بين كل الأجهزة',
+        )
 
         unsubLibrary = subscribeSharedDoc(
           CLOUD_PATHS.library,
-          (data) => {
-            if (!data || !Array.isArray(data.exerciseLibrary)) {
-              return
-            }
-            ignoreLibraryWriteRef.current = true
-            const sections = Array.isArray(data.customSections)
-              ? data.customSections
-              : []
-            setCustomSections(sections)
-            setExerciseLibrary(
-              mergeWithCatalog(
-                data.exerciseLibrary,
-                mergeCustomSections(sections),
-              ),
-            )
-          },
+          applyRemoteLibrary,
           () => setCloudStatus('error'),
         )
 
         unsubHistory = subscribeSharedDoc(
           CLOUD_PATHS.history,
-          (data) => {
-            if (!data || !Array.isArray(data.items)) {
-              return
-            }
-            ignoreHistoryWriteRef.current = true
-            setCourseHistory(data.items)
-          },
+          applyRemoteHistory,
           () => setCloudStatus('error'),
         )
 
         unsubAccess = subscribeSharedDoc(
           CLOUD_PATHS.access,
-          (data) => {
-            if (!data) {
-              return
-            }
-            const next = {
-              enabled: Boolean(data.enabled && data.pinHash),
-              pinHash: typeof data.pinHash === 'string' ? data.pinHash : '',
-            }
-            ignoreAccessWriteRef.current = true
-            setAccessLock(next)
-            persistAccessLockConfig(next)
-            setSecurityWantCode(next.enabled)
-            if (!next.enabled) {
-              setIsAccessUnlocked(true)
-            } else if (!readAccessSessionUnlocked()) {
-              setIsAccessUnlocked(false)
-            }
-          },
+          applyRemoteAccess,
           () => setCloudStatus('error'),
         )
 
         unsubDraft = subscribeSharedDoc(
           CLOUD_PATHS.draft,
-          (data) => {
-            if (!data || !Array.isArray(data.coursePlan)) {
-              return
-            }
-            ignoreDraftWriteRef.current = true
-            setCoursePlan(
-              data.coursePlan.map((day) => normalizeDayExercises(day ?? [])),
-            )
-            if (data.scheduleMode) {
-              setScheduleMode(data.scheduleMode)
-            }
-            if (data.workoutPatternId) {
-              setWorkoutPatternId(data.workoutPatternId)
-            }
-            if (Array.isArray(data.selectedWeekDayIds)) {
-              setSelectedWeekDayIds(data.selectedWeekDayIds)
-            }
-            if (Array.isArray(data.customDayLabels)) {
-              setCustomDayLabels(data.customDayLabels)
-            }
-            if (data.formData && typeof data.formData === 'object') {
-              setFormData((previous) => ({
-                ...previous,
-                ...data.formData,
-                playerName: previous.playerName,
-                weight: previous.weight,
-                height: previous.height,
-              }))
-            }
-            if (typeof data.activeHistoryId === 'string' || data.activeHistoryId === null) {
-              setActiveHistoryId(data.activeHistoryId)
-            }
-          },
+          applyRemoteDraft,
           () => setCloudStatus('error'),
         )
       } catch {
@@ -1574,11 +1591,11 @@ function App() {
     ) ?? null
 
   const toggleWeekDay = (dayId) => {
-    setSelectedWeekDayIds((previous) =>
-      previous.includes(dayId)
-        ? previous.filter((item) => item !== dayId)
-        : [...previous, dayId],
-    )
+    const next = selectedWeekDayIds.includes(dayId)
+      ? selectedWeekDayIds.filter((item) => item !== dayId)
+      : [...selectedWeekDayIds, dayId]
+    setSelectedWeekDayIds(next)
+    flushDraftToCloud({ selectedWeekDayIds: next })
   }
 
   const addCustomDayLabel = () => {
@@ -1590,12 +1607,16 @@ function App() {
       setCustomDayInput('')
       return
     }
-    setCustomDayLabels((previous) => [...previous, trimmed])
+    const next = [...customDayLabels, trimmed]
+    setCustomDayLabels(next)
     setCustomDayInput('')
+    flushDraftToCloud({ customDayLabels: next })
   }
 
   const removeCustomDayLabel = (label) => {
-    setCustomDayLabels((previous) => previous.filter((item) => item !== label))
+    const next = customDayLabels.filter((item) => item !== label)
+    setCustomDayLabels(next)
+    flushDraftToCloud({ customDayLabels: next })
   }
 
   const openLibraryTab = () => {
@@ -1847,13 +1868,7 @@ function App() {
 
   const saveDraft = () => {
     const draft = {
-      formData: {
-        ...formData,
-        // لا نحفظ بيانات اللاعب بالمسودة حتى تبقى فاضية عند كل فتح
-        playerName: '',
-        weight: '',
-        height: '',
-      },
+      formData: { ...formData },
       exerciseLibrary: mergeWithCatalog(exerciseLibrary, muscleSections),
       coursePlan,
       scheduleMode,
@@ -1873,7 +1888,7 @@ function App() {
       activeHistoryId: draft.activeHistoryId,
     })
     upsertHistoryRecord('draft')
-    setStatusMessage('تم حفظ المسودة على Firebase والسجل')
+    setStatusMessage('تم حفظ كل بيانات المسودة على Firebase والسجل')
   }
 
   const getCourseFileBaseName = () => {

@@ -14,6 +14,50 @@ export const CLOUD_PATHS = {
   draft: ['shared', 'draft'],
 }
 
+// Firestore لا يدعم nested arrays — نحفظ coursePlan كقائمة كائنات
+export const encodeCoursePlanForCloud = (coursePlan) =>
+  (Array.isArray(coursePlan) ? coursePlan : []).map((day, dayIndex) => ({
+    dayIndex,
+    slots: Array.isArray(day) ? day : [],
+  }))
+
+export const decodeCoursePlanFromCloud = (encoded) => {
+  if (!Array.isArray(encoded) || !encoded.length) {
+    return []
+  }
+  // توافق قديم إن وُجدت مصفوفات متداخلة محلياً فقط
+  if (Array.isArray(encoded[0])) {
+    return encoded.map((day) => (Array.isArray(day) ? day : []))
+  }
+  const maxDay = encoded.reduce(
+    (max, item) =>
+      Math.max(max, typeof item?.dayIndex === 'number' ? item.dayIndex : -1),
+    -1,
+  )
+  if (maxDay < 0) {
+    return []
+  }
+  const days = Array.from({ length: maxDay + 1 }, () => [])
+  encoded.forEach((item) => {
+    if (typeof item?.dayIndex === 'number') {
+      days[item.dayIndex] = Array.isArray(item.slots) ? item.slots : []
+    }
+  })
+  return days
+}
+
+const encodeHistoryItemsForCloud = (items) =>
+  (Array.isArray(items) ? items : []).map((item) => ({
+    ...item,
+    coursePlan: encodeCoursePlanForCloud(item?.coursePlan),
+  }))
+
+const decodeHistoryItemsFromCloud = (items) =>
+  (Array.isArray(items) ? items : []).map((item) => ({
+    ...item,
+    coursePlan: decodeCoursePlanFromCloud(item?.coursePlan),
+  }))
+
 const toMillis = (value) => {
   if (!value) {
     return 0
@@ -135,12 +179,22 @@ export const writeHistoryCloud = async (items) => {
   await setDoc(
     doc(db, ...CLOUD_PATHS.history),
     {
-      items: Array.isArray(items) ? items : [],
+      items: encodeHistoryItemsForCloud(items),
       updatedAt: serverTimestamp(),
       savedAt: new Date().toISOString(),
     },
     { merge: true },
   )
+}
+
+export const normalizeHistoryCloudData = (data) => {
+  if (!data) {
+    return null
+  }
+  return {
+    ...data,
+    items: decodeHistoryItemsFromCloud(data.items),
+  }
 }
 
 export const writeAccessCloud = async (config) => {
@@ -165,15 +219,27 @@ export const writeDraftCloud = async (draft) => {
   if (!db) {
     return
   }
+  const { coursePlan, ...rest } = draft || {}
   await setDoc(
     doc(db, ...CLOUD_PATHS.draft),
     {
-      ...draft,
+      ...rest,
+      coursePlan: encodeCoursePlanForCloud(coursePlan),
       updatedAt: serverTimestamp(),
       savedAt: new Date().toISOString(),
     },
     { merge: true },
   )
+}
+
+export const normalizeDraftCloudData = (data) => {
+  if (!data) {
+    return null
+  }
+  return {
+    ...data,
+    coursePlan: decodeCoursePlanFromCloud(data.coursePlan),
+  }
 }
 
 export const isRemoteNewer = (remoteUpdatedAt, localSavedAt) =>
