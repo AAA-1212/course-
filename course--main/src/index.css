@@ -4,6 +4,14 @@
   box-sizing: border-box;
 }
 
+html {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 :root {
   font-family: 'Cairo', 'Segoe UI', Tahoma, Arial, sans-serif;
   line-height: 1.5;
@@ -17,12 +25,17 @@
 
 body {
   margin: 0;
+  width: 100%;
+  max-width: 100%;
   min-height: 100vh;
   min-height: 100dvh;
   overflow-x: hidden;
+  overscroll-behavior-x: none;
 }
 
 #root {
+  width: 100%;
+  max-width: 100%;
   min-height: 100vh;
   min-height: 100dvh;
   overflow-x: hidden;
