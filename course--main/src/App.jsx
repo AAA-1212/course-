@@ -4,6 +4,7 @@ import { jsPDF } from 'jspdf'
 import {
   CLOUD_PATHS,
   connectCloudSync,
+  FIRESTORE_LIBRARY_DOC_PATH,
   normalizeDraftCloudData,
   normalizeHistoryCloudData,
   readSharedDoc,
@@ -13,7 +14,7 @@ import {
   writeHistoryCloud,
   writeLibraryCloud,
 } from './cloudSync'
-import { isFirebaseConfigured } from './firebase'
+import { ensureFirebaseSignedIn, isFirebaseConfigured } from './firebase'
 import './App.css'
 
 const CENTER_NAME = 'مركز القمة كلاسك'
@@ -807,17 +808,28 @@ function App() {
       }
 
       const sectionsForDraft = mergeCustomSections(uniqueSections)
-      setExerciseLibrary(
-        mergeWithCatalog(
-          restoredLibraryItems.length ? restoredLibraryItems : buildSeedLibrary(),
-          sectionsForDraft,
-        ),
-      )
+      if (isFirebaseConfigured()) {
+        // مع Firebase: المصدر الأساسي Firestore — لا نحمّل المكتبة من localStorage
+        setExerciseLibrary(buildSeedLibrary())
+        setCourseHistory([])
+        console.debug(
+          '[Firestore DEBUG] app open: waiting for read ←',
+          FIRESTORE_LIBRARY_DOC_PATH,
+        )
+      } else {
+        setExerciseLibrary(
+          mergeWithCatalog(
+            restoredLibraryItems.length ? restoredLibraryItems : buildSeedLibrary(),
+            sectionsForDraft,
+          ),
+        )
+        setCourseHistory(loadHistoryFromStorage())
+      }
 
-      // تأكيد بقاء السجل كما هو من التخزين المحلي للجهاز
-      setCourseHistory(loadHistoryFromStorage())
-
-      if (rawDraft || rawLibrary || loadHistoryFromStorage().length) {
+      if (
+        !isFirebaseConfigured() &&
+        (rawDraft || rawLibrary || loadHistoryFromStorage().length)
+      ) {
         setStatusMessage('تم استرجاع المكتبة والسجل المحفوظين على هذا الجهاز')
       }
     } catch {
@@ -920,17 +932,31 @@ function App() {
     )
   }
 
-  const flushLibraryToCloud = (library = exerciseLibrary, sections = customSections) => {
-    if (!cloudReadyRef.current || ignoreLibraryWriteRef.current) {
-      return Promise.resolve()
+  const flushLibraryToCloud = async (
+    library = exerciseLibrary,
+    sections = customSections,
+  ) => {
+    if (ignoreLibraryWriteRef.current) {
+      console.debug('[Firestore DEBUG] flushLibrary skipped (remote sync echo)')
+      return { skipped: true, reason: 'remote-echo' }
     }
-    return writeLibraryCloud({
-      exerciseLibrary: mergeWithCatalog(library, mergeCustomSections(sections)),
-      customSections: sections,
-      catalogVersion: CATALOG_VERSION,
-    })
-      .then(() => setCloudStatus('live'))
-      .catch(markCloudWriteError)
+    if (!isFirebaseConfigured()) {
+      console.debug('[Firestore DEBUG] flushLibrary skipped (no Firebase config)')
+      return { skipped: true, reason: 'no-config' }
+    }
+    try {
+      await ensureFirebaseSignedIn()
+      const result = await writeLibraryCloud({
+        exerciseLibrary: mergeWithCatalog(library, mergeCustomSections(sections)),
+        customSections: sections,
+        catalogVersion: CATALOG_VERSION,
+      })
+      setCloudStatus('live')
+      return result
+    } catch (error) {
+      markCloudWriteError(error)
+      throw error
+    }
   }
 
   const flushHistoryToCloud = (history = courseHistory) => {
@@ -983,6 +1009,12 @@ function App() {
     if (!data || !Array.isArray(data.exerciseLibrary)) {
       return
     }
+    console.debug('[Firestore DEBUG] read library ←', FIRESTORE_LIBRARY_DOC_PATH, {
+      exerciseCount: data.exerciseLibrary.length,
+      sectionCount: Array.isArray(data.customSections)
+        ? data.customSections.length
+        : 0,
+    })
     ignoreLibraryWriteRef.current = true
     const sections = Array.isArray(data.customSections) ? data.customSections : []
     setCustomSections(sections)
@@ -1121,6 +1153,10 @@ function App() {
         }
 
         // Firebase هو المصدر الأساسي: نطبّق السحابة قبل تفعيل الكتابة
+        console.debug('[Firestore DEBUG] app open read ←', FIRESTORE_LIBRARY_DOC_PATH, {
+          exists: Boolean(remoteLibrary),
+          exerciseCount: remoteLibrary?.exerciseLibrary?.length ?? 0,
+        })
         if (remoteLibrary) {
           applyRemoteLibrary(remoteLibrary)
         } else {
@@ -1207,7 +1243,7 @@ function App() {
   }, [hasHydrated])
 
   useEffect(() => {
-    if (!hasHydrated || !cloudReady) {
+    if (!hasHydrated || !isFirebaseConfigured()) {
       return undefined
     }
     if (ignoreLibraryWriteRef.current) {
@@ -1226,7 +1262,7 @@ function App() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasHydrated, cloudReady, exerciseLibrary, customSections, muscleSections])
+  }, [hasHydrated, exerciseLibrary, customSections, muscleSections])
 
   useEffect(() => {
     if (!hasHydrated || !cloudReady) {
@@ -1362,11 +1398,16 @@ function App() {
     setExerciseDraft((previous) => ({ ...previous, [name]: value }))
   }
 
-  const saveExercise = () => {
+  const saveExercise = async () => {
     const trimmedName = exerciseDraft.name.trim()
     if (!trimmedName) {
       return
     }
+
+    console.debug('[Firestore DEBUG] saveExercise clicked', {
+      mode: editingExerciseId ? 'edit' : 'add',
+      targetDoc: FIRESTORE_LIBRARY_DOC_PATH,
+    })
 
     const section = getSectionById(exerciseDraft.sectionId, muscleSections)
     const payload = {
@@ -1376,29 +1417,43 @@ function App() {
       notes: exerciseDraft.notes.trim() || 'بدون ملاحظات',
     }
 
-    if (editingExerciseId) {
-      const nextLibrary = exerciseLibrary.map((exercise) =>
-        exercise.id === editingExerciseId
-          ? normalizeExercise({ ...exercise, ...payload }, muscleSections)
-          : exercise,
+    try {
+      if (editingExerciseId) {
+        const nextLibrary = exerciseLibrary.map((exercise) =>
+          exercise.id === editingExerciseId
+            ? normalizeExercise({ ...exercise, ...payload }, muscleSections)
+            : exercise,
+        )
+        setExerciseLibrary(nextLibrary)
+        const result = await flushLibraryToCloud(nextLibrary, customSections)
+        console.debug('[Firestore DEBUG] saveExercise setDoc result', result)
+        setStatusMessage(
+          `تم تعديل التمرين — setDoc OK → ${FIRESTORE_LIBRARY_DOC_PATH} (${result?.exerciseCount ?? nextLibrary.length} تمرين)`,
+        )
+      } else {
+        const newItem = normalizeExercise(
+          {
+            id: `ex-custom-${Date.now()}`,
+            ...payload,
+            isCustom: true,
+          },
+          muscleSections,
+        )
+        const nextLibrary = [newItem, ...exerciseLibrary]
+        setExerciseLibrary(nextLibrary)
+        setLibrarySectionId(section.id)
+        const result = await flushLibraryToCloud(nextLibrary, customSections)
+        console.debug('[Firestore DEBUG] saveExercise setDoc result', result)
+        setStatusMessage(
+          `تم إضافة التمرين — setDoc OK → ${FIRESTORE_LIBRARY_DOC_PATH} (${result?.exerciseCount ?? nextLibrary.length} تمرين)`,
+        )
+      }
+    } catch (error) {
+      console.error('[Firestore DEBUG] saveExercise FAILED', error)
+      setStatusMessage(
+        `فشل حفظ التمرين في Firestore: ${error?.message || error?.code || 'unknown error'}`,
       )
-      setExerciseLibrary(nextLibrary)
-      flushLibraryToCloud(nextLibrary, customSections)
-      setStatusMessage('تم تعديل التمرين وحفظه على Firebase')
-    } else {
-      const newItem = normalizeExercise(
-        {
-          id: `ex-custom-${Date.now()}`,
-          ...payload,
-          isCustom: true,
-        },
-        muscleSections,
-      )
-      const nextLibrary = [newItem, ...exerciseLibrary]
-      setExerciseLibrary(nextLibrary)
-      setLibrarySectionId(section.id)
-      flushLibraryToCloud(nextLibrary, customSections)
-      setStatusMessage('تم إضافة التمرين وحفظه على Firebase')
+      return
     }
 
     setExerciseDraft({

@@ -14,6 +14,9 @@ export const CLOUD_PATHS = {
   draft: ['shared', 'draft'],
 }
 
+/** مسار مستند المكتبة في Firestore: collection/document = shared/library */
+export const FIRESTORE_LIBRARY_DOC_PATH = CLOUD_PATHS.library.join('/')
+
 // Firestore لا يدعم nested arrays — نحفظ coursePlan كقائمة كائنات
 export const encodeCoursePlanForCloud = (coursePlan) =>
   (Array.isArray(coursePlan) ? coursePlan : []).map((day, dayIndex) => ({
@@ -156,19 +159,23 @@ export const writeLibraryCloud = async ({
 }) => {
   const db = getFirebaseDb()
   if (!db) {
-    return
+    throw new Error('Firestore غير مهيأ')
   }
-  await setDoc(
-    doc(db, ...CLOUD_PATHS.library),
-    {
-      exerciseLibrary,
-      customSections,
-      catalogVersion,
-      updatedAt: serverTimestamp(),
-      savedAt: new Date().toISOString(),
-    },
-    { merge: true },
-  )
+  const docPath = FIRESTORE_LIBRARY_DOC_PATH
+  const payload = {
+    exerciseLibrary,
+    customSections,
+    catalogVersion,
+    updatedAt: serverTimestamp(),
+    savedAt: new Date().toISOString(),
+  }
+  console.debug('[Firestore DEBUG] setDoc start →', docPath, {
+    exerciseCount: Array.isArray(exerciseLibrary) ? exerciseLibrary.length : 0,
+    sectionCount: Array.isArray(customSections) ? customSections.length : 0,
+  })
+  await setDoc(doc(db, ...CLOUD_PATHS.library), payload, { merge: true })
+  console.debug('[Firestore DEBUG] setDoc OK →', docPath)
+  return { docPath, exerciseCount: payload.exerciseLibrary?.length ?? 0 }
 }
 
 export const writeHistoryCloud = async (items) => {
